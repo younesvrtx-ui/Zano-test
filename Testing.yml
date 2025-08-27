@@ -1,0 +1,211 @@
+name: CI - Build Zano & Basic RPC tests
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    env:
+      CMAKE_VERSION: "3.26.3"
+      BOOST_VERSION: "1.84.0"
+      BOOST_TARBALL: "boost_1_84_0.tar.bz2"
+      OPENSSL_VERSION: "1.1.1w"
+      BUILD_OPENSSL: "true"        # set to "false" to skip building OpenSSL and use system libssl-dev
+      ZANO_REPO: "https://github.com/hyle-team/zano.git"
+    steps:
+
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        submodules: recursive
+
+    - name: Install OS packages (build deps)
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        # essential build tools and helpful tools for debugging
+        sudo apt-get install -y build-essential curl wget ca-certificates git python3 python3-pip pkg-config jq \
+          bzip2 xz-utils libbz2-dev zlib1g-dev liblzma-dev libssl-dev ca-certificates file autoconf automake libtool
+
+    - name: Install CMake ${ { env.CMAKE_VERSION } }
+      run: |
+        set -euo pipefail
+        wget https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.sh
+        chmod +x cmake-${CMAKE_VERSION}-linux-x86_64.sh
+        sudo mkdir -p /opt/cmake
+        sudo sh cmake-${CMAKE_VERSION}-linux-x86_64.sh --prefix=/opt/cmake --skip-license
+        sudo ln -sf /opt/cmake/bin/cmake /usr/local/bin/cmake
+        cmake --version
+
+    - name: Cache Boost build (stage folder)
+      uses: actions/cache@v4
+      id: cache-boost
+      with:
+        path: |
+          boost_1_84_0
+          boost_stage_cache
+        key: boost-${{ runner.os }}-boost1-84-${{ hashFiles('**/boost_1_84_0.tar.bz2') }}
+        restore-keys: |
+          boost-${{ runner.os }}-boost1-84-
+
+    - name: Download and build Boost 1.84 (if not cached)
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -d "boost_1_84_0/stage" ]; then
+          echo "Boost already staged - skipping rebuild"
+          ls -l boost_1_84_0/stage || true
+        else
+          curl -OL https://archives.boost.io/release/1.84.0/source/boost_1_84_0.tar.bz2
+          echo "cc4b893acf645c9d4b698e9a0f08ca8846aa5d6c68275c14c3e7949c24109454  boost_1_84_0.tar.bz2" | sha256sum -c -
+          tar -xjf boost_1_84_0.tar.bz2
+          rm boost_1_84_0.tar.bz2
+          cd boost_1_84_0
+          ./bootstrap.sh --with-libraries=system,filesystem,thread,date_time,chrono,regex,serialization,atomic,program_options,locale,timer,log
+          ./b2 -j$(nproc) stage
+          cd ..
+        fi
+        # expose env for following steps
+        echo "BOOST_ROOT=$PWD/boost_1_84_0" >> $GITHUB_ENV
+        echo "BOOST_LIBRARYDIR=$PWD/boost_1_84_0/stage/lib" >> $GITHUB_ENV
+        ls -l $BOOST_LIBRARYDIR || true
+
+    - name: Cache OpenSSL sources & built (optional)
+      if: env.BUILD_OPENSSL == 'true'
+      uses: actions/cache@v4
+      id: cache-openssl
+      with:
+        path: openssl-${{ env.OPENSSL_VERSION }} openssl_build_cache
+        key: openssl-${{ runner.os }}-openssl-${{ env.OPENSSL_VERSION }}-v1
+
+    - name: Build OpenSSL ${ { env.OPENSSL_VERSION } } (optional)
+      if: env.BUILD_OPENSSL == 'true'
+      run: |
+        set -euo pipefail
+        if [ -d "openssl-${OPENSSL_VERSION}" ] && [ -d "$HOME/openssl" ]; then
+          echo "OpenSSL built/cached - reusing"
+        else
+          curl -OL https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz
+          echo "cf3098950cb4d853ad95c0841f1f9c6d3dc102dccfcacd521d93925208b76ac8  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
+          tar xaf openssl-${OPENSSL_VERSION}.tar.gz
+          cd openssl-${OPENSSL_VERSION}
+          ./config --prefix=$HOME/openssl --openssldir=$HOME/openssl shared zlib
+          make -j$(nproc)
+          make install_sw
+          cd ..
+        fi
+        echo "OPENSSL_ROOT_DIR=$HOME/openssl" >> $GITHUB_ENV
+        echo "OPENSSL_LIBRARIES=$HOME/openssl/lib" >> $GITHUB_ENV
+        echo "OPENSSL_INCLUDE_DIR=$HOME/openssl/include" >> $GITHUB_ENV
+        ls -l $HOME/openssl || true
+
+    - name: Show environment & quick debug info
+      run: |
+        set -euo pipefail
+        echo "PATH: $PATH"
+        cmake --version || true
+        gcc --version
+        uname -a
+        df -h
+
+    - name: Build Zano
+      run: |
+        set -euo pipefail
+        # keep build dir inside workspace
+        cd $GITHUB_WORKSPACE
+        # make sure the repo is present (checkout step already did this)
+        if [ ! -d "zano" ]; then
+          git clone --recursive $ZANO_REPO zano
+        fi
+        cd zano
+        mkdir -p build
+        cd build
+
+        # Additional CMake hints for robust detection
+        # - Provide BOOST_ROOT and BOOST_LIBRARYDIR
+        # - Provide OPENSSL_ROOT_DIR if we built OpenSSL, otherwise let system libs be used
+        export BOOST_ROOT=${BOOST_ROOT:-$PWD/../../boost_1_84_0}
+        export BOOST_LIBRARYDIR=${BOOST_LIBRARYDIR:-$PWD/../../boost_1_84_0/stage/lib}
+
+        CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Release -DBOOST_ROOT=$BOOST_ROOT -DBOOST_LIBRARYDIR=$BOOST_LIBRARYDIR"
+
+        if [ -n "${OPENSSL_ROOT_DIR-}" ]; then
+          CMAKE_FLAGS="$CMAKE_FLAGS -DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR -DOPENSSL_LIBRARIES=$OPENSSL_LIBRARIES -DOPENSSL_INCLUDE_DIR=$OPENSSL_INCLUDE_DIR"
+        fi
+
+        # If detection fails, enable trace and dump CMakeLogs for debugging
+        set +e
+        cmake .. $CMAKE_FLAGS 2>&1 | tee cmake_output.txt
+        CMRC=$?
+        set -e
+        if [ $CMRC -ne 0 ]; then
+          echo "CMake failed -- dumping CMakeError.log & CMakeOutput.log (if present)"
+          find . -maxdepth 2 -type f -name "CMakeError.log" -o -name "CMakeOutput.log" -o -name "cmake_output.txt" -print -exec sed -n '1,200p' {} \;
+          exit $CMRC
+        fi
+
+        make -j$(nproc) 2>&1 | tee make_output.txt
+        # expose path to built binaries for the remainder of the job
+        echo "ZANO_BUILD_DIR=$(pwd)" >> $GITHUB_ENV
+        ls -l $(pwd)/src || true
+
+    - name: Run isolated daemon runs and test RPCs
+      run: |
+        set -euo pipefail
+        cd $ZANO_BUILD_DIR/src
+
+        # Run the daemon in testnet mode, bind RPC & P2P to localhost only to guarantee isolation in CI
+        ./zanod --testnet --no-igd --hide-my-port --rpc-bind-ip 127.0.0.1 --rpc-bind-port 11211 --p2p-bind-ip 127.0.0.1 --data-dir=ci_default_data --log-file=ci_default_log.txt &
+        PID=$!
+        echo "daemon started pid $PID"
+        sleep 10
+
+        echo "RPC get_info (node default)"
+        curl -s -X POST http://127.0.0.1:11211/json_rpc -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":"0","method":"get_info"}' | jq || true
+
+        kill $PID || true
+        wait $PID 2>/dev/null || true
+        tail -n 200 ci_default_log.txt || true
+
+        # Second run with --disable-debug-p2p-requests
+        ./zanod --testnet --no-igd --hide-my-port --disable-debug-p2p-requests --rpc-bind-ip 127.0.0.1 --rpc-bind-port 11212 --p2p-bind-ip 127.0.0.1 --data-dir=ci_debug_data --log-file=ci_debug_log.txt &
+        PID2=$!
+        echo "daemon2 started pid $PID2"
+        sleep 10
+
+        echo "RPC get_info (node debug)"
+        curl -s -X POST http://127.0.0.1:11212/json_rpc -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":"0","method":"get_info"}' | jq || true
+
+        kill $PID2 || true
+        wait $PID2 2>/dev/null || true
+        tail -n 200 ci_debug_log.txt || true
+
+    - name: Upload logs & artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: zano-ci-logs
+        path: |
+          zano/build/src/ci_default_log.txt
+          zano/build/src/ci_debug_log.txt
+          zano/build/src/cm* || true
+          zano/build/src/make_output.txt || true
+          zano/build/src/cmake_output.txt || true
+          boost_1_84_0/stage/lib || true
+          $HOME/openssl || true
+
+    - name: Final env dump (for debugging)
+      run: |
+        set -euo pipefail
+        echo "Files in workspace:"
+        ls -la
+        echo "Done"
